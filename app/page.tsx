@@ -10,12 +10,22 @@ import { siteConfig } from "@/config/site";
 import { title, subtitle } from "@/components/primitives";
 import { GithubIcon } from "@/components/icons";
 
+const WS_URL = process.env.NEXT_PUBLIC_BACKEND_WS || "ws://127.0.0.1:8000/ws";
+const UPLOAD_URL =
+  process.env.NEXT_PUBLIC_BACKEND_UPLOAD ||
+  "http://127.0.0.1:8000/upload-reference";
+
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const [isRunning, setIsRunning] = useState(false);
+  const outImgRef = useRef<HTMLImageElement | null>(null);
 
-  // --- функция запуска камеры ---
+  const [isRunning, setIsRunning] = useState(false);
+  const [wsState, setWsState] = useState<"disconnected" | "connecting" | "connected">("disconnected");
+  const wsRef = useRef<WebSocket | null>(null);
+  const rafRef = useRef<number | null>(null);
+
+  // --- камера ---
   const startCamera = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -33,75 +43,166 @@ export default function Home() {
     }
   };
 
-  // --- стоп камеры ---
   const stopCamera = () => {
-    const video = videoRef.current;
-    if (video && video.srcObject) {
-      const tracks = (video.srcObject as MediaStream).getTracks();
-      tracks.forEach((t) => t.stop());
-      video.srcObject = null;
-      setIsRunning(false);
+    const v = videoRef.current;
+    if (v?.srcObject) {
+      (v.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
+      v.srcObject = null;
     }
+    setIsRunning(false);
   };
 
-  // --- отрисовка кадра на canvas (демо) ---
+  // --- WebSocket ---
+  const connectWs = () => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) return;
+    setWsState("connecting");
+    const ws = new WebSocket(WS_URL);
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => setWsState("connected");
+    ws.onclose = () => {
+      setWsState("disconnected");
+      wsRef.current = null;
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
+    ws.onerror = () => setWsState("disconnected");
+    ws.onmessage = (e) => {
+      const url = URL.createObjectURL(new Blob([e.data]));
+      const img = outImgRef.current;
+      if (img) {
+        const old = img.src;
+        img.src = url;
+        if (old) URL.revokeObjectURL(old);
+      }
+    };
+    wsRef.current = ws;
+  };
+
+  const disconnectWs = () => wsRef.current?.close();
+
+  // --- цикл отправки кадров на сервер (~30 fps) ---
   useEffect(() => {
-    let frameId: number;
-    const draw = () => {
+    let last = 0;
+    const loop = async (t: number) => {
+      const ws = wsRef.current;
       const v = videoRef.current;
       const c = canvasRef.current;
-      if (v && c && v.readyState >= 2) {
-        const ctx = c.getContext("2d");
-        if (ctx) {
-          c.width = v.videoWidth;
-          c.height = v.videoHeight;
-          ctx.drawImage(v, 0, 0, c.width, c.height);
-          // пример простого эффекта: рамка
-          ctx.strokeStyle = "violet";
-          ctx.lineWidth = 6;
-          ctx.strokeRect(20, 20, c.width - 40, c.height - 40);
-        }
-      }
-      frameId = requestAnimationFrame(draw);
+      rafRef.current = requestAnimationFrame(loop);
+      if (!ws || ws.readyState !== WebSocket.OPEN || !v || !c || v.readyState < 2) return;
+
+      // ~30 fps
+      if (t - last < 33) return;
+      last = t;
+
+      const ctx = c.getContext("2d");
+      if (!ctx) return;
+      c.width = v.videoWidth;
+      c.height = v.videoHeight;
+      ctx.drawImage(v, 0, 0, c.width, c.height);
+
+      // простой маркер — видно, что кадр идёт через canvas
+      ctx.strokeStyle = "violet";
+      ctx.lineWidth = 6;
+      ctx.strokeRect(20, 20, c.width - 40, c.height - 40);
+
+      const blob: Blob = await new Promise((res) =>
+        c.toBlob((b) => res(b!), "image/jpeg", 0.8)!
+      );
+      try {
+        ws.send(await blob.arrayBuffer());
+      } catch {}
     };
-    if (isRunning) frameId = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(frameId);
-  }, [isRunning]);
+
+    if (isRunning && wsState === "connected") {
+      rafRef.current = requestAnimationFrame(loop);
+    } else if (rafRef.current) {
+      cancelAnimationFrame(rafRef.current);
+    }
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
+  }, [isRunning, wsState]);
+
+  // --- загрузка референс-фото на /upload-reference ---
+  const onUploadRef = async (file: File) => {
+    const fd = new FormData();
+    fd.append("img", file);
+    const res = await fetch(UPLOAD_URL, { method: "POST", body: fd });
+    const j = await res.json().catch(() => ({}));
+    if (!j?.ok) alert(j?.msg || "Сервер не принял изображение (нет лица?).");
+  };
 
   return (
-    <section className="flex flex-col items-center text-center">
-      <div className="mt-16 w-full max-w-3xl flex flex-col items-center gap-4">
-        <h2 className="text-xl font-semibold">🎥 Webcam Demo</h2>
+    <section className="flex flex-col items-center justify-center gap-4 py-8 md:py-10">
 
-        <div className="relative border rounded-2xl overflow-hidden w-full aspect-video bg-black">
-          <video
-            ref={videoRef}
-            className="absolute inset-0 w-full h-full object-cover opacity-60"
-            muted
-            playsInline
-          />
-          <canvas
-            ref={canvasRef}
-            className="absolute inset-0 w-full h-full object-contain"
-          />
+      {/* ---------- камера + canvas + серверный выход ---------- */}
+      <div className="mt-16 w-full max-w-4xl flex flex-col items-center gap-4">
+        <h2 className="text-xl font-semibold">🎥 Webcam → WS → Output</h2>
+
+        <div className="grid md:grid-cols-2 gap-4 w-full">
+          {/* Вход: video + canvas (что отправляем) */}
+          <div className="relative border rounded-2xl overflow-hidden w-full aspect-video bg-black">
+            <video
+              ref={videoRef}
+              className="absolute inset-0 w-full h-full object-cover opacity-60"
+              muted
+              playsInline
+            />
+            <canvas
+              ref={canvasRef}
+              className="absolute inset-0 w-full h-full object-contain"
+            />
+            <div className="absolute left-2 top-2 text-[11px] bg-white/20 backdrop-blur text-white px-2 py-0.5 rounded">
+              Вход (отправляется на сервер)
+            </div>
+          </div>
+
+          {/* Выход: то, что прислал сервер */}
+          <div className="relative border rounded-2xl overflow-hidden w-full aspect-video bg-black">
+            <img
+              ref={outImgRef}
+              className="absolute inset-0 w-full h-full object-contain"
+              alt="AI output"
+            />
+            <div className="absolute left-2 top-2 text-[11px] bg-white/20 backdrop-blur text-white px-2 py-0.5 rounded">
+              Выход (от сервера)
+            </div>
+          </div>
         </div>
 
-        <div className="flex gap-3">
-          {!isRunning ? (
-            <button
-              onClick={startCamera}
-              className="px-4 py-2 rounded-xl bg-violet-600 text-white hover:bg-violet-700"
-            >
-              Запустить камеру
+        <div className="flex flex-wrap gap-3">
+          {isRunning ? (
+            <button onClick={stopCamera} className="px-4 py-2 rounded-xl bg-gray-200 hover:bg-gray-300">
+              Камера: стоп
             </button>
           ) : (
-            <button
-              onClick={stopCamera}
-              className="px-4 py-2 rounded-xl bg-gray-200 hover:bg-gray-300"
-            >
-              Остановить
+            <button onClick={startCamera} className="px-4 py-2 rounded-xl bg-violet-600 text-white hover:bg-violet-700">
+              Камера: старт
             </button>
           )}
+
+          {wsState !== "connected" ? (
+            <button onClick={connectWs} className="px-4 py-2 rounded-xl bg-black text-white">
+              Подключить WS
+            </button>
+          ) : (
+            <button onClick={disconnectWs} className="px-4 py-2 rounded-xl bg-gray-200 hover:bg-gray-300">
+              Отключить WS
+            </button>
+          )}
+
+          <label className="px-4 py-2 rounded-xl bg-slate-900 text-white cursor-pointer">
+            Загрузить референс
+            <input
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={(e) => e.target.files && onUploadRef(e.target.files[0])}
+            />
+          </label>
+
+          <span className="text-sm opacity-70 self-center">
+            WS: {wsState} • {WS_URL.replace(/^ws(s)?:\/\//, "")}
+          </span>
         </div>
       </div>
     </section>
