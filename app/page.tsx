@@ -1,14 +1,6 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Link } from "@heroui/link";
-import { Snippet } from "@heroui/snippet";
-import { Code } from "@heroui/code";
-import { button as buttonStyles } from "@heroui/theme";
-
-import { siteConfig } from "@/config/site";
-import { title, subtitle } from "@/components/primitives";
-import { GithubIcon } from "@/components/icons";
 
 const WS_URL = process.env.NEXT_PUBLIC_BACKEND_WS || "ws://127.0.0.1:8000/ws";
 const UPLOAD_URL =
@@ -25,7 +17,6 @@ export default function Home() {
   const wsRef = useRef<WebSocket | null>(null);
   const rafRef = useRef<number | null>(null);
 
-  // --- камера ---
   const startCamera = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -79,7 +70,6 @@ export default function Home() {
 
   const disconnectWs = () => wsRef.current?.close();
 
-  // --- цикл отправки кадров на сервер (~30 fps) ---
   useEffect(() => {
     let last = 0;
     const loop = async (t: number) => {
@@ -89,7 +79,6 @@ export default function Home() {
       rafRef.current = requestAnimationFrame(loop);
       if (!ws || ws.readyState !== WebSocket.OPEN || !v || !c || v.readyState < 2) return;
 
-      // ~30 fps
       if (t - last < 33) return;
       last = t;
 
@@ -99,7 +88,6 @@ export default function Home() {
       c.height = v.videoHeight;
       ctx.drawImage(v, 0, 0, c.width, c.height);
 
-      // простой маркер — видно, что кадр идёт через canvas
       ctx.strokeStyle = "violet";
       ctx.lineWidth = 6;
       ctx.strokeRect(20, 20, c.width - 40, c.height - 40);
@@ -122,7 +110,6 @@ export default function Home() {
     };
   }, [isRunning, wsState]);
 
-  // --- загрузка референс-фото на /upload-reference ---
   const onUploadRef = async (file: File) => {
     const fd = new FormData();
     fd.append("img", file);
@@ -134,12 +121,10 @@ export default function Home() {
   return (
     <section className="flex flex-col items-center justify-center gap-4 py-8 md:py-10">
 
-      {/* ---------- камера + canvas + серверный выход ---------- */}
       <div className="mt-16 w-full max-w-4xl flex flex-col items-center gap-4">
         <h2 className="text-xl font-semibold">🎥 Webcam → WS → Output</h2>
 
         <div className="grid md:grid-cols-2 gap-4 w-full">
-          {/* Вход: video + canvas (что отправляем) */}
           <div className="relative border rounded-2xl overflow-hidden w-full aspect-video bg-black">
             <video
               ref={videoRef}
@@ -156,7 +141,6 @@ export default function Home() {
             </div>
           </div>
 
-          {/* Выход: то, что прислал сервер */}
           <div className="relative border rounded-2xl overflow-hidden w-full aspect-video bg-black">
             <img
               ref={outImgRef}
