@@ -1,4 +1,4 @@
-# Local AI Face-Swap (Next.js + FastAPI + InsightFace)
+# BetAI-Local AI Face-Swap (Next.js + FastAPI + InsightFace)
 
 Real-time **face-swap** demo: Next.js frontend + FastAPI backend using **InsightFace** and ONNX model `inswapper_128.onnx`.
 
