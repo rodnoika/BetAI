@@ -16,6 +16,7 @@ export default function Home() {
   const [wsState, setWsState] = useState<"disconnected" | "connecting" | "connected">("disconnected");
   const wsRef = useRef<WebSocket | null>(null);
   const rafRef = useRef<number | null>(null);
+  const inflightRef = useRef(false);
 
   const startCamera = async () => {
     try {
@@ -43,7 +44,6 @@ export default function Home() {
     setIsRunning(false);
   };
 
-  // --- WebSocket ---
   const connectWs = () => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
     setWsState("connecting");
@@ -54,6 +54,7 @@ export default function Home() {
       setWsState("disconnected");
       wsRef.current = null;
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      inflightRef.current = false;
     };
     ws.onerror = () => setWsState("disconnected");
     ws.onmessage = (e) => {
@@ -64,6 +65,7 @@ export default function Home() {
         img.src = url;
         if (old) URL.revokeObjectURL(old);
       }
+      inflightRef.current = false;
     };
     wsRef.current = ws;
   };
@@ -71,42 +73,45 @@ export default function Home() {
   const disconnectWs = () => wsRef.current?.close();
 
   useEffect(() => {
-    let last = 0;
-    const loop = async (t: number) => {
+    let raf: number | null = null;
+    const loop = async () => {
       const ws = wsRef.current;
       const v = videoRef.current;
       const c = canvasRef.current;
-      rafRef.current = requestAnimationFrame(loop);
+      rafRef.current = raf = requestAnimationFrame(loop);
       if (!ws || ws.readyState !== WebSocket.OPEN || !v || !c || v.readyState < 2) return;
-
-      if (t - last < 33) return;
-      last = t;
+      if (inflightRef.current) return;
 
       const ctx = c.getContext("2d");
       if (!ctx) return;
-      c.width = v.videoWidth;
-      c.height = v.videoHeight;
-      ctx.drawImage(v, 0, 0, c.width, c.height);
 
-      ctx.strokeStyle = "violet";
-      ctx.lineWidth = 6;
-      ctx.strokeRect(20, 20, c.width - 40, c.height - 40);
+      const targetW = 640;
+      const scale = targetW / v.videoWidth;
+      const w = targetW;
+      const h = Math.max(1, Math.round(v.videoHeight * scale));
+      c.width = w; c.height = h;
+      ctx.drawImage(v, 0, 0, w, h);
 
       const blob: Blob = await new Promise((res) =>
-        c.toBlob((b) => res(b!), "image/jpeg", 0.8)!
+        c.toBlob((b) => res(b!), "image/jpeg", 0.65)!
       );
       try {
+        inflightRef.current = true;
         ws.send(await blob.arrayBuffer());
-      } catch {}
+      } catch {
+        inflightRef.current = false;
+      }
     };
 
     if (isRunning && wsState === "connected") {
-      rafRef.current = requestAnimationFrame(loop);
+      rafRef.current = raf = requestAnimationFrame(loop);
     } else if (rafRef.current) {
       cancelAnimationFrame(rafRef.current);
+      inflightRef.current = false;
     }
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      inflightRef.current = false;
     };
   }, [isRunning, wsState]);
 
@@ -120,8 +125,7 @@ export default function Home() {
 
   return (
     <section className="flex flex-col items-center justify-center gap-4 py-8 md:py-10">
-
-      <div className="mt-16 w-full max-w-4xl flex flex-col items-center gap-4">
+      <div className="mt-6 w-full max-w-4xl flex flex-col items-center gap-4">
         <h2 className="text-xl font-semibold">🎥 Webcam → WS → Output</h2>
 
         <div className="grid md:grid-cols-2 gap-4 w-full">
