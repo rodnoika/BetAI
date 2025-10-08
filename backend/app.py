@@ -121,7 +121,7 @@ async def ws_stream(ws: WebSocket):
                 frame = cv2.resize(frame, (640, int(h*s)), interpolation=cv2.INTER_AREA)
 
             if REF_FACE is None:
-                out = overlay_watermark(frame, "Upload reference to start")
+                out = overlay_watermark(frame, "")
             else:
                 FRAMES_SINCE_DET += 1
                 use_cache = (
