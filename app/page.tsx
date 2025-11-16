@@ -6,6 +6,9 @@ const WS_URL = process.env.NEXT_PUBLIC_BACKEND_WS || "ws://127.0.0.1:8000/ws";
 const UPLOAD_URL =
   process.env.NEXT_PUBLIC_BACKEND_UPLOAD ||
   "http://127.0.0.1:8000/upload-reference";
+const PROCESS_URL =
+  process.env.NEXT_PUBLIC_BACKEND_PROCESS_VIDEO ||
+  "http://127.0.0.1:8000/process-video";
 
 
 export default function Home() {
@@ -26,6 +29,9 @@ export default function Home() {
   const wsRef = useRef<WebSocket | null>(null);
   const rafRef = useRef<number | null>(null);
   const inflightRef = useRef(false);
+  const processingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const jobPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const jobStartTimeRef = useRef<number | null>(null);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -34,6 +40,11 @@ export default function Home() {
 
   const [refId, setRefId] = useState<string | null>(null);
   const [refThumbUrl, setRefThumbUrl] = useState<string | null>(null);
+  const [videoProgress, setVideoProgress] = useState(0);
+  const [videoStatus, setVideoStatus] = useState("");
+  const [isVideoProcessing, setIsVideoProcessing] = useState(false);
+  const [etaSeconds, setEtaSeconds] = useState<number | null>(null);
+  const [processedVideoUrl, setProcessedVideoUrl] = useState<string | null>(null);
 
   const startCamera = async () => {
     try {
@@ -91,6 +102,25 @@ export default function Home() {
   };
 
   const disconnectWs = () => wsRef.current?.close();
+  const clearProcessingTimer = () => {
+    if (processingTimerRef.current) {
+      clearInterval(processingTimerRef.current);
+      processingTimerRef.current = null;
+    }
+  };
+  const etaTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const clearEtaTimer = () => {
+    if (etaTimerRef.current) {
+      clearInterval(etaTimerRef.current);
+      etaTimerRef.current = null;
+    }
+  };
+  const clearJobPoll = () => {
+    if (jobPollRef.current) {
+      clearInterval(jobPollRef.current);
+      jobPollRef.current = null;
+    }
+  };
 
   useEffect(() => {
     let raf: number | null = null;
@@ -137,6 +167,18 @@ export default function Home() {
     };
   }, [isRunning, wsState]);
 
+  useEffect(() => {
+    return () => clearProcessingTimer();
+  }, []);
+
+  useEffect(() => {
+    return () => clearEtaTimer();
+  }, []);
+
+  useEffect(() => {
+    return () => clearJobPoll();
+  }, []);
+
   const refreshRefInfo = async () => {
     try {
       const r = await fetch(`${BACKEND_ORIGIN}/reference-info`);
@@ -163,6 +205,140 @@ export default function Home() {
     if (j.thumb) {
       setRefThumbUrl(`${BACKEND_ORIGIN}${j.thumb}?ts=${Date.now()}`);
     }
+  };
+
+  const getVideoDuration = (file: File) =>
+    new Promise<number>((resolve) => {
+      const url = URL.createObjectURL(file);
+      const v = document.createElement("video");
+      v.preload = "metadata";
+      v.onloadedmetadata = () => {
+        URL.revokeObjectURL(url);
+        resolve(v.duration || 0);
+      };
+      v.onerror = () => {
+        URL.revokeObjectURL(url);
+        resolve(0);
+      };
+      v.src = url;
+    });
+
+  const formatEta = (seconds: number) => {
+    const s = Math.max(0, Math.round(seconds));
+    if (s >= 90) {
+      const m = Math.floor(s / 60);
+      const rem = s % 60;
+      return `${m}м ${rem}с`;
+    }
+    return `${s}с`;
+  };
+
+  const onUploadVideo = async (file: File) => {
+    if (!file) return;
+    if (isVideoProcessing) {
+      alert("Дождитесь завершения текущей обработки.");
+      return;
+    }
+    if (processedVideoUrl) {
+      URL.revokeObjectURL(processedVideoUrl);
+      setProcessedVideoUrl(null);
+    }
+    setVideoProgress(0);
+    setVideoStatus("Загружаем видео...");
+    setIsVideoProcessing(true);
+    setEtaSeconds(null);
+    clearEtaTimer();
+    clearJobPoll();
+
+    const fd = new FormData();
+    fd.append("video", file);
+
+    let jobId: string | null = null;
+    try {
+      const res = await fetch(PROCESS_URL, { method: "POST", body: fd });
+      const j = await res.json();
+      if (!res.ok || !j?.ok || !j.job_id) {
+        const msg = j?.msg || "Сервер не принял видео.";
+        throw new Error(msg);
+      }
+      jobId = j.job_id as string;
+    } catch (err: any) {
+      setIsVideoProcessing(false);
+      setVideoStatus(err?.message || "Ошибка отправки");
+      alert(err?.message || "Ошибка отправки видео.");
+      return;
+    }
+
+    const duration = await getVideoDuration(file).catch(() => 0);
+    const estimatedSeconds = Math.max(10, Math.min(300, duration * 1.1 + 8));
+    setEtaSeconds(estimatedSeconds);
+    jobStartTimeRef.current = Date.now();
+    etaTimerRef.current = setInterval(() => {
+      setEtaSeconds((s) => {
+        if (s === null) return s;
+        const next = Math.max(0, s - 1);
+        if (next === 0) clearEtaTimer();
+        return next;
+      });
+    }, 1000);
+
+    const computeEta = (progress: number) => {
+      if (!jobStartTimeRef.current || progress <= 0) return null;
+      const elapsed = (Date.now() - jobStartTimeRef.current) / 1000;
+      const remaining = elapsed * (100 - progress) / Math.max(progress, 1e-3);
+      return remaining;
+    };
+
+    const pollJob = async () => {
+      if (!jobId) return;
+      try {
+        const res = await fetch(`${BACKEND_ORIGIN}/job-status/${jobId}`);
+        const j = await res.json();
+        if (!res.ok || !j?.ok) {
+          throw new Error(j?.msg || "Ошибка статуса");
+        }
+        const prog = typeof j.progress === "number" ? j.progress : 0;
+        setVideoProgress(Math.max(0, Math.min(100, prog)));
+        if (j.msg) setVideoStatus(j.msg);
+
+        if (j.status === "processing") {
+          const eta = computeEta(prog);
+          setEtaSeconds(eta !== null ? eta : etaSeconds);
+          return;
+        }
+
+        if (j.status === "done") {
+          const resVideo = await fetch(`${BACKEND_ORIGIN}/job-result/${jobId}`);
+          if (!resVideo.ok) {
+            throw new Error("Не удалось получить файл результата.");
+          }
+          const blob = await resVideo.blob();
+          const url = URL.createObjectURL(blob);
+          setProcessedVideoUrl(url);
+          setVideoProgress(100);
+          setVideoStatus("Готово");
+          setEtaSeconds(0);
+          setIsVideoProcessing(false);
+          clearJobPoll();
+          clearEtaTimer();
+          return;
+        }
+
+        if (j.status === "error") {
+          throw new Error(j.msg || "Ошибка обработки.");
+        }
+      } catch (err: any) {
+        setIsVideoProcessing(false);
+        setVideoStatus(err?.message || "Ошибка обработки.");
+        setEtaSeconds(null);
+        clearJobPoll();
+        clearEtaTimer();
+        alert(err?.message || "Ошибка обработки.");
+      }
+    };
+
+    pollJob();
+    jobPollRef.current = setInterval(pollJob, 1000);
   };
 
   useEffect(() => {
@@ -227,6 +403,60 @@ export default function Home() {
               onChange={(e) => e.target.files && onUploadRef(e.target.files[0])}
             />
           </label>
+        </div>
+
+        <div className="w-full p-4 rounded-2xl border flex flex-col gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="text-sm font-semibold">Видео с подменой лица (загрузка файла)</div>
+            {videoStatus && (
+              <span className="text-xs px-2 py-1 rounded-full bg-slate-100 text-slate-800">
+                {videoStatus}
+              </span>
+            )}
+            {isVideoProcessing && etaSeconds !== null && (
+              <span className="text-xs px-2 py-1 rounded-full bg-blue-50 text-blue-700 border border-blue-200">
+                ETA ~ {formatEta(etaSeconds)}
+              </span>
+            )}
+            <label className="px-4 py-2 rounded-xl bg-slate-900 text-white cursor-pointer">
+              Upload video
+              <input
+                type="file"
+                accept="video/*"
+                className="hidden"
+                onChange={(e) => e.target.files && onUploadVideo(e.target.files[0])}
+              />
+            </label>
+          </div>
+
+          {(isVideoProcessing || videoProgress > 0) && (
+            <div className="w-full h-2 rounded-full bg-gray-200 overflow-hidden">
+              <div
+                className="h-full bg-blue-600 transition-all duration-200"
+                style={{ width: `${Math.min(100, Math.max(2, videoProgress))}%` }}
+              />
+            </div>
+          )}
+
+          {processedVideoUrl && (
+            <div className="grid md:grid-cols-2 gap-3 items-center">
+              <video
+                controls
+                src={processedVideoUrl}
+                className="w-full rounded-xl border bg-black"
+              />
+              <div className="flex gap-3 items-center">
+                <a
+                  href={processedVideoUrl}
+                  download={`faceswap_${Date.now()}.mp4`}
+                  className="px-4 py-2 rounded-xl bg-emerald-600 text-white"
+                >
+                  Скачать результат
+                </a>
+                <div className="text-xs opacity-70">Готовый файл можно скачать или просмотреть справа.</div>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="grid md:grid-cols-2 gap-4 w-full">

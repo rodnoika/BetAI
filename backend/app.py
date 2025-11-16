@@ -1,8 +1,9 @@
 from fastapi import FastAPI, WebSocket, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketDisconnect
-from fastapi.responses import Response, JSONResponse
-import asyncio, os, numpy as np, cv2, insightface, onnxruntime as ort
+from fastapi.responses import Response, JSONResponse, FileResponse
+import asyncio, os, tempfile, uuid, threading, concurrent.futures
+import numpy as np, cv2, insightface, onnxruntime as ort
 
 app = FastAPI()
 app.add_middleware(
@@ -37,6 +38,10 @@ LAST_TGT_LM106 = None
 LAST_TGT_EMB = None
 FRAMES_SINCE_DET = 0
 DETECT_EVERY = 4 
+
+JOBS = {}
+job_lock = threading.Lock()
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 def area(face):
     x1, y1, x2, y2 = face.bbox.astype(int)
@@ -96,6 +101,169 @@ async def reference_info():
         "thumb": "/reference-thumb" if REF_THUMB_JPG else None,
         "has_face": REF_FACE is not None
     })
+
+def process_frame_with_cache(frame, cache):
+    """Run swap on a frame using a tiny cache to reduce detector calls."""
+    if REF_FACE is None:
+        return overlay_watermark(frame, "")
+
+    cache["frames_since_det"] += 1
+    use_cache = (
+        cache["bbox"] is not None and
+        cache["kps"] is not None and
+        cache["emb"] is not None and
+        (cache["frames_since_det"] % DETECT_EVERY != 0)
+    )
+
+    if use_cache:
+        class FakeFace: pass
+        tgt = FakeFace()
+        tgt.bbox = np.array(cache["bbox"], dtype=np.float32)
+        tgt.kps = cache["kps"]
+        tgt.landmark_2d_106 = cache["lm106"]
+        tgt.normed_embedding = cache["emb"]
+    else:
+        faces = face_app.get(frame)
+        tgt = largest_face(faces)
+        cache["frames_since_det"] = 0
+        if tgt is not None:
+            cache["bbox"] = tgt.bbox.astype(float).tolist()
+            cache["kps"] = getattr(tgt, "kps", None)
+            cache["lm106"] = getattr(tgt, "landmark_2d_106", None)
+            cache["emb"] = getattr(tgt, "normed_embedding", None)
+
+    if tgt is None:
+        return overlay_watermark(frame)
+    try:
+        return swapper.get(frame, tgt, REF_FACE, paste_back=True)
+    except Exception as e:
+        return overlay_watermark(frame, f"swap error: {e}")
+
+def register_job(job_id, status="queued", progress=0.0, msg="", result_path=None):
+    with job_lock:
+        JOBS[job_id] = {
+            "status": status,
+            "progress": float(progress),
+            "msg": msg,
+            "result_path": result_path,
+        }
+
+def update_job(job_id, **kwargs):
+    with job_lock:
+        if job_id not in JOBS:
+            return
+        JOBS[job_id].update(kwargs)
+
+def get_job(job_id):
+    with job_lock:
+        return JOBS.get(job_id)
+
+def process_video_job(job_id, in_path, filename):
+    cache = {"bbox": None, "kps": None, "lm106": None, "emb": None, "frames_since_det": 0}
+
+    cap = cv2.VideoCapture(in_path)
+    if not cap.isOpened():
+        update_job(job_id, status="error", msg="Не удалось прочитать видео.")
+        os.remove(in_path)
+        return
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 360)
+    if width <= 0 or height <= 0:
+        width, height = 640, 360
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    tmp_out.close()
+    writer = cv2.VideoWriter(
+        tmp_out.name,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps if fps > 0 else 25.0,
+        (width, height),
+    )
+    if not writer.isOpened():
+        cap.release()
+        os.remove(in_path)
+        os.remove(tmp_out.name)
+        update_job(job_id, status="error", msg="Не удалось подготовить файл для записи.")
+        return
+
+    try:
+        idx = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            out = process_frame_with_cache(frame, cache)
+            writer.write(out)
+            idx += 1
+            if frame_count > 0 and idx % 5 == 0:
+                progress = min(99.0, (idx / frame_count) * 100.0)
+                update_job(job_id, status="processing", progress=progress, msg="Обработка...")
+        update_job(job_id, status="done", progress=100.0, msg="Готово", result_path=tmp_out.name)
+    except Exception as e:
+        update_job(job_id, status="error", msg=f"Ошибка обработки: {e}")
+        try:
+            os.remove(tmp_out.name)
+        except OSError:
+            pass
+    finally:
+        cap.release()
+        writer.release()
+        try:
+            os.remove(in_path)
+        except OSError:
+            pass
+
+@app.post("/process-video")
+async def process_video(video: UploadFile = File(...)):
+    """Accept a video, enqueue face swap job, return job id."""
+    if REF_FACE is None:
+        return JSONResponse({"ok": False, "msg": "Загрузите эталонное лицо перед обработкой видео."}, status_code=400)
+
+    tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(video.filename or ".mp4")[1] or ".mp4")
+    try:
+        while True:
+            chunk = await video.read(1024 * 1024)
+            if not chunk:
+                break
+            tmp_in.write(chunk)
+        tmp_in.flush()
+    finally:
+        tmp_in.close()
+
+    job_id = uuid.uuid4().hex
+    register_job(job_id, status="queued", progress=0.0, msg="В очереди...")
+    executor.submit(process_video_job, job_id, tmp_in.name, video.filename or "video.mp4")
+
+    return JSONResponse({"ok": True, "job_id": job_id})
+
+@app.get("/job-status/{job_id}")
+async def job_status(job_id: str):
+    job = get_job(job_id)
+    if job is None:
+        return JSONResponse({"ok": False, "msg": "job not found"}, status_code=404)
+    return JSONResponse({
+        "ok": True,
+        "job_id": job_id,
+        "status": job["status"],
+        "progress": job.get("progress", 0.0),
+        "msg": job.get("msg", ""),
+        "ready": job["status"] == "done",
+    })
+
+@app.get("/job-result/{job_id}")
+async def job_result(job_id: str):
+    job = get_job(job_id)
+    if job is None:
+        return JSONResponse({"ok": False, "msg": "job not found"}, status_code=404)
+    if job["status"] != "done" or not job.get("result_path"):
+        return JSONResponse({"ok": False, "msg": "not ready"}, status_code=400)
+    path = job["result_path"]
+    if not os.path.exists(path):
+        return JSONResponse({"ok": False, "msg": "file missing"}, status_code=404)
+    return FileResponse(path, media_type="video/mp4", filename=f"faceswap_{job_id}.mp4")
 
 @app.websocket("/ws")
 async def ws_stream(ws: WebSocket):

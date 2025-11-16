@@ -12,6 +12,20 @@
 /.next/
 /out/
 
+# python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.idea/
+.ipynb_checkpoints
+backend/models/inswapper_128.onnx
+
 # production
 /build
 
