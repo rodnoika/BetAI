@@ -3,7 +3,7 @@
 Real-time **face-swap** demo: Next.js frontend + FastAPI backend using **InsightFace** and ONNX model `inswapper_128.onnx`.
 
 ![Demo preview](public/video.gif)
-Camera → JPEG frames via WebSocket → backend → swapped JPEGs back → rendered live.
+
 
 > ⚠️ The model file (`inswapper_128.onnx`) is **not** included in Git. Place it manually under `backend/models/`.
 
