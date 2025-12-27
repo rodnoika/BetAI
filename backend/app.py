@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, UploadFile, File
+from fastapi import FastAPI, WebSocket, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketDisconnect
 from fastapi.responses import Response, JSONResponse, FileResponse
@@ -38,6 +38,9 @@ LAST_TGT_LM106 = None
 LAST_TGT_EMB = None
 FRAMES_SINCE_DET = 0
 DETECT_EVERY = 4 
+TARGET_EMB = None
+TARGET_ID = None
+TARGET_SIM_THRESHOLD = 0.35
 
 JOBS = {}
 job_lock = threading.Lock()
@@ -49,6 +52,31 @@ def area(face):
 
 def largest_face(faces):
     return max(faces, key=area) if faces else None
+
+def face_similarity(a, b):
+    if a is None or b is None:
+        return -1.0
+    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-6
+    return float(np.dot(a, b) / denom)
+
+def choose_target_face(faces):
+    if not faces:
+        return None
+    if TARGET_EMB is None:
+        return largest_face(faces)
+    best = None
+    best_sim = -1.0
+    for face in faces:
+        emb = getattr(face, "normed_embedding", None)
+        if emb is None:
+            continue
+        sim = face_similarity(emb, TARGET_EMB)
+        if sim > best_sim:
+            best_sim = sim
+            best = face
+    if best is not None and best_sim >= TARGET_SIM_THRESHOLD:
+        return best
+    return largest_face(faces)
 
 def overlay_watermark(img, text="AI face swap (local)"):
     out = img.copy()
@@ -102,8 +130,46 @@ async def reference_info():
         "has_face": REF_FACE is not None
     })
 
+@app.post("/detect-faces")
+async def detect_faces(img: UploadFile = File(...)):
+    data = np.frombuffer(await img.read(), np.uint8)
+    frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if frame is None:
+        return JSONResponse({"ok": False, "msg": "Не удалось прочитать файл"}, status_code=400)
+    faces = face_app.get(frame)
+    result = []
+    for idx, f in enumerate(faces):
+        x1, y1, x2, y2 = f.bbox.astype(float).tolist()
+        result.append({"idx": idx, "bbox": [x1, y1, x2, y2], "score": float(getattr(f, "det_score", 0.0))})
+    return JSONResponse({"ok": True, "faces": result, "count": len(result)})
+
+@app.post("/select-target")
+async def select_target(idx: int = Form(...), img: UploadFile = File(...)):
+    global TARGET_EMB, TARGET_ID, LAST_TGT_BBOX, LAST_TGT_KPS, LAST_TGT_LM106, LAST_TGT_EMB, FRAMES_SINCE_DET
+    data = np.frombuffer(await img.read(), np.uint8)
+    frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if frame is None:
+        return JSONResponse({"ok": False, "msg": "Не удалось прочитать файл"}, status_code=400)
+    faces = face_app.get(frame)
+    if not faces or idx < 0 or idx >= len(faces):
+        return JSONResponse({"ok": False, "msg": "Лицо не найдено по индексу"}, status_code=400)
+    tgt = faces[idx]
+    TARGET_EMB = getattr(tgt, "normed_embedding", None)
+    if TARGET_EMB is None:
+        return JSONResponse({"ok": False, "msg": "Нет embedding для лица"}, status_code=400)
+    TARGET_ID = f"face_{idx}"
+    LAST_TGT_BBOX = None
+    LAST_TGT_KPS = None
+    LAST_TGT_LM106 = None
+    LAST_TGT_EMB = None
+    FRAMES_SINCE_DET = 0
+    return JSONResponse({"ok": True, "msg": "Целевое лицо выбрано", "target_id": TARGET_ID})
+
+@app.get("/target-info")
+async def target_info():
+    return JSONResponse({"ok": True, "has_target": TARGET_EMB is not None, "target_id": TARGET_ID})
+
 def process_frame_with_cache(frame, cache):
-    """Run swap on a frame using a tiny cache to reduce detector calls."""
     if REF_FACE is None:
         return overlay_watermark(frame, "")
 
@@ -124,7 +190,7 @@ def process_frame_with_cache(frame, cache):
         tgt.normed_embedding = cache["emb"]
     else:
         faces = face_app.get(frame)
-        tgt = largest_face(faces)
+        tgt = choose_target_face(faces)
         cache["frames_since_det"] = 0
         if tgt is not None:
             cache["bbox"] = tgt.bbox.astype(float).tolist()
@@ -218,7 +284,6 @@ def process_video_job(job_id, in_path, filename):
 
 @app.post("/process-video")
 async def process_video(video: UploadFile = File(...)):
-    """Accept a video, enqueue face swap job, return job id."""
     if REF_FACE is None:
         return JSONResponse({"ok": False, "msg": "Загрузите эталонное лицо перед обработкой видео."}, status_code=400)
 

@@ -10,6 +10,7 @@ const PROCESS_URL =
   process.env.NEXT_PUBLIC_BACKEND_PROCESS_VIDEO ||
   "http://127.0.0.1:8000/process-video";
 
+type DetectedFace = { idx: number; bbox: [number, number, number, number]; score: number };
 
 export default function Home() {
   const BACKEND_ORIGIN = useMemo(() => {
@@ -45,6 +46,14 @@ export default function Home() {
   const [isVideoProcessing, setIsVideoProcessing] = useState(false);
   const [etaSeconds, setEtaSeconds] = useState<number | null>(null);
   const [processedVideoUrl, setProcessedVideoUrl] = useState<string | null>(null);
+  const [detectedFaces, setDetectedFaces] = useState<DetectedFace[]>([]);
+  const [detectPreview, setDetectPreview] = useState<string | null>(null);
+  const [detectSize, setDetectSize] = useState<{ w: number; h: number } | null>(null);
+  const [isDetecting, setIsDetecting] = useState(false);
+  const [targetMsg, setTargetMsg] = useState<string>("");
+  const [selectedTargetIdx, setSelectedTargetIdx] = useState<number | null>(null);
+  const [hasBackendTarget, setHasBackendTarget] = useState(false);
+  const lastDetectBlobRef = useRef<Blob | null>(null);
 
   const startCamera = async () => {
     try {
@@ -179,6 +188,22 @@ export default function Home() {
     return () => clearJobPoll();
   }, []);
 
+  useEffect(() => {
+    return () => {
+      if (detectPreview) URL.revokeObjectURL(detectPreview);
+    };
+  }, [detectPreview]);
+
+  const refreshTargetInfo = async () => {
+    try {
+      const r = await fetch(`${BACKEND_ORIGIN}/target-info`);
+      const j = await r.json();
+      setHasBackendTarget(!!j?.has_target);
+    } catch {
+      setHasBackendTarget(false);
+    }
+  };
+
   const refreshRefInfo = async () => {
     try {
       const r = await fetch(`${BACKEND_ORIGIN}/reference-info`);
@@ -190,6 +215,73 @@ export default function Home() {
         setRefThumbUrl(null);
       }
     } catch {}
+  };
+
+  const captureFrame = async (): Promise<{ blob: Blob; url: string; w: number; h: number }> => {
+    const v = videoRef.current;
+    if (!v || v.readyState < 2) {
+      throw new Error("Нет активного кадра видео.");
+    }
+    const w = v.videoWidth || 640;
+    const h = v.videoHeight || 360;
+    const c = document.createElement("canvas");
+    c.width = w;
+    c.height = h;
+    const ctx = c.getContext("2d");
+    if (!ctx) throw new Error("Нет доступа к canvas.");
+    ctx.drawImage(v, 0, 0, w, h);
+    const blob: Blob = await new Promise((res, rej) =>
+      c.toBlob((b) => (b ? res(b) : rej(new Error("Не удалось получить кадр."))), "image/jpeg", 0.85)
+    );
+    const url = URL.createObjectURL(blob);
+    return { blob, url, w, h };
+  };
+
+  const scanFaces = async () => {
+    if (isDetecting) return;
+    setIsDetecting(true);
+    setTargetMsg("Сканируем лица...");
+    try {
+      const { blob, url, w, h } = await captureFrame();
+      if (detectPreview) URL.revokeObjectURL(detectPreview);
+      lastDetectBlobRef.current = blob;
+      setDetectPreview(url);
+      setDetectSize({ w, h });
+
+      const fd = new FormData();
+      fd.append("img", blob, "frame.jpg");
+      const res = await fetch(`${BACKEND_ORIGIN}/detect-faces`, { method: "POST", body: fd });
+      const j = await res.json();
+      if (!res.ok || !j?.ok) throw new Error(j?.msg || "Не удалось найти лица.");
+      setDetectedFaces(j.faces || []);
+      setTargetMsg(`Найдено лиц: ${j.count ?? (j.faces?.length || 0)}`);
+    } catch (err: any) {
+      setDetectedFaces([]);
+      setTargetMsg(err?.message || "Ошибка сканирования.");
+      alert(err?.message || "Ошибка сканирования.");
+    } finally {
+      setIsDetecting(false);
+    }
+  };
+
+  const selectTargetFace = async (idx: number) => {
+    if (idx === undefined || idx === null) return;
+    const blob = lastDetectBlobRef.current;
+    if (!blob) return alert("Сначала просканируйте кадр.");
+    const fd = new FormData();
+    fd.append("idx", String(idx));
+    fd.append("img", blob, "frame.jpg");
+    try {
+      const res = await fetch(`${BACKEND_ORIGIN}/select-target`, { method: "POST", body: fd });
+      const j = await res.json();
+      if (!res.ok || !j?.ok) throw new Error(j?.msg || "Не удалось выбрать лицо.");
+      setSelectedTargetIdx(idx);
+      setTargetMsg(j.msg || "Целевое лицо выбрано");
+      setHasBackendTarget(true);
+      refreshTargetInfo();
+    } catch (err: any) {
+      alert(err?.message || "Ошибка выбора лица.");
+    }
   };
 
   const onUploadRef = async (file: File) => {
@@ -238,6 +330,10 @@ export default function Home() {
     if (isVideoProcessing) {
       alert("Дождитесь завершения текущей обработки.");
       return;
+    }
+    if (!hasBackendTarget) {
+      const go = confirm("Целевое лицо не выбрано. Продолжить со случайным лицом?");
+      if (!go) return;
     }
     if (processedVideoUrl) {
       URL.revokeObjectURL(processedVideoUrl);
@@ -343,7 +439,11 @@ export default function Home() {
 
   useEffect(() => {
     refreshRefInfo();
-    const t = setInterval(refreshRefInfo, 5000);
+    refreshTargetInfo();
+    const t = setInterval(() => {
+      refreshRefInfo();
+      refreshTargetInfo();
+    }, 5000);
     return () => clearInterval(t);
   }, [BACKEND_ORIGIN]);
 
@@ -403,6 +503,62 @@ export default function Home() {
               onChange={(e) => e.target.files && onUploadRef(e.target.files[0])}
             />
           </label>
+        </div>
+
+        <div className="w-full p-4 rounded-2xl border flex flex-col gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="text-sm font-semibold">Целевое лицо (выбор конкретного человека)</div>
+            {targetMsg && (
+              <span className="text-xs px-2 py-1 rounded-full bg-slate-100 text-slate-800">
+                {targetMsg}
+              </span>
+            )}
+            <span className="text-xs px-2 py-1 rounded-full border">
+              Текущая цель: {hasBackendTarget ? "установлена" : "не выбрана"}
+            </span>
+            <button
+              onClick={scanFaces}
+              disabled={isDetecting || !isRunning}
+              className="px-3 py-1.5 rounded-lg bg-indigo-600 text-white disabled:opacity-50"
+            >
+              {isDetecting ? "Сканируем..." : "Сканировать кадр"}
+            </button>
+          </div>
+
+          {detectPreview ? (
+            <div
+              className="relative w-full max-w-3xl border rounded-xl overflow-hidden"
+              style={{ aspectRatio: detectSize ? `${detectSize.w}/${detectSize.h}` : "16/9" }}
+            >
+              <img src={detectPreview} alt="Detected frame" className="w-full h-full object-contain" />
+              {detectSize &&
+                detectedFaces.map((f) => {
+                  const [x1, y1, x2, y2] = f.bbox;
+                  const left = (x1 / detectSize.w) * 100;
+                  const top = (y1 / detectSize.h) * 100;
+                  const width = ((x2 - x1) / detectSize.w) * 100;
+                  const height = ((y2 - y1) / detectSize.h) * 100;
+                  const isSelected = selectedTargetIdx === f.idx;
+                  return (
+                    <div
+                      key={f.idx}
+                      className={`absolute border-2 cursor-pointer ${isSelected ? "border-emerald-400" : "border-yellow-400"} bg-yellow-300/10`}
+                      style={{ left: `${left}%`, top: `${top}%`, width: `${width}%`, height: `${height}%` }}
+                      onClick={() => selectTargetFace(f.idx)}
+                      title="Выбрать это лицо"
+                    >
+                      <div className="absolute -top-5 left-0 text-xs font-semibold bg-black text-white px-1 rounded">
+                        #{f.idx}
+                      </div>
+                    </div>
+                  );
+                })}
+            </div>
+          ) : (
+            <div className="text-sm opacity-70">
+              Нажмите "Сканировать кадр", затем кликните по нужному лицу, чтобы привязать подмену именно к нему.
+            </div>
+          )}
         </div>
 
         <div className="w-full p-4 rounded-2xl border flex flex-col gap-3">
