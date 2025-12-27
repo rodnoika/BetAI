@@ -44,13 +44,13 @@ NEXT_PUBLIC_BACKEND_UPLOAD=http://127.0.0.1:8000/upload-reference
 
 ## Install dependencies for Backend
 
-2. For CPU:
-```powershell
-pip install --upgrade pip
-pip install fastapi uvicorn numpy opencv-python insightface onnxruntime
-```
+> For CPU:
+> ```powershell
+> pip install --upgrade pip
+> pip install fastapi uvicorn numpy opencv-python insightface onnxruntime
+> ```
 
-> 💡 For GPU:
+> For GPU:
 > ```powershell
 > pip uninstall -y onnxruntime
 > pip install onnxruntime-gpu
